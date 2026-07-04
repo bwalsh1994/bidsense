@@ -82,3 +82,23 @@ def write_audit_log(
         log.error(f"Audit log write error: {errors}")
     else:
         log.info(f"Audit log written: {action_id} → {outcome}")
+
+def get_audience_rules(client_account_id: str) -> list:
+    """Fetch active audience rules for a client from BigQuery."""
+    query = f"""
+        SELECT rule_name, rule_value, rule_action
+        FROM `{PROJECT}.{DATASET}.rules_config`
+        WHERE client_account_id = @account_id
+          AND rule_category = 'audience_rules'
+          AND is_active = TRUE
+        ORDER BY rule_name
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id)
+        ]
+    )
+    results = BQ_CLIENT.query(query, job_config=job_config).result()
+    rules = [dict(row) for row in results]
+    log.info(f"Loaded {len(rules)} audience rules for {client_account_id}")
+    return rules

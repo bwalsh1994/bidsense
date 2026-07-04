@@ -1,6 +1,6 @@
 import logging
 import uuid
-from bigquery import get_spend_rules, get_audience_rules, get_campaign_structure_rules, get_recent_campaigns, get_client_name, write_audit_log
+from bigquery import get_spend_rules, get_audience_rules, get_campaign_structure_rules, get_recent_campaigns, get_creative_rules, lookup_creative, get_client_name, write_audit_log
 from firestore import write_approval_queue
 from notify import send_flag_notification, send_block_notification
 
@@ -246,6 +246,99 @@ def evaluate_campaign_structure(rules: list, proposed_action: dict, recent_campa
         "reason": reason,
         "rules_evaluated": rules_evaluated
     }
+def evaluate_creative_rules(rules: list, proposed_action: dict, creative: dict) -> dict:
+    """
+    Evaluate creative rules against a proposed action.
+    Checks creative exists in approved library and matches campaign objective.
+    """
+    image_hash = proposed_action.get("image_hash", None)
+    objective = proposed_action.get("objective", "")
+    rules_evaluated = []
+    final_outcome = "APPROVED"
+    rule_triggered = None
+    reason = None
+
+    rule_map = {r["rule_name"]: r for r in rules}
+
+    # ── Rule 1: require_approved_creative ─────────────────────────────────────
+    if "require_approved_creative" in rule_map:
+        required = rule_map["require_approved_creative"]["rule_value"].lower() == "true"
+        action = rule_map["require_approved_creative"]["rule_action"]
+
+        if required and not image_hash:
+            passed = False
+            rules_evaluated.append({
+                "rule": "require_approved_creative",
+                "passed": False,
+                "reason": "No image hash provided",
+                "action_if_fail": action
+            })
+            final_outcome = action
+            rule_triggered = "creative_rules.require_approved_creative"
+            reason = "No creative asset specified — image hash required for all campaigns"
+
+        elif required and image_hash:
+            if not creative:
+                passed = False
+                rules_evaluated.append({
+                    "rule": "require_approved_creative",
+                    "image_hash": image_hash,
+                    "passed": False,
+                    "reason": "Hash not found in creative library",
+                    "action_if_fail": action
+                })
+                final_outcome = action
+                rule_triggered = "creative_rules.require_approved_creative"
+                reason = f"Image hash {image_hash} not found in approved creative library"
+
+            elif not creative.get("is_approved", False):
+                passed = False
+                rules_evaluated.append({
+                    "rule": "require_approved_creative",
+                    "image_hash": image_hash,
+                    "asset_name": creative.get("asset_name"),
+                    "passed": False,
+                    "reason": "Asset found but not approved",
+                    "action_if_fail": action
+                })
+                final_outcome = action
+                rule_triggered = "creative_rules.require_approved_creative"
+                reason = f"Creative '{creative.get('asset_name')}' is in the library but has not been approved for use"
+
+            else:
+                rules_evaluated.append({
+                    "rule": "require_approved_creative",
+                    "image_hash": image_hash,
+                    "asset_name": creative.get("asset_name"),
+                    "passed": True,
+                    "action_if_fail": action
+                })
+
+    # ── Rule 2: creative_must_match_objective ─────────────────────────────────
+    if "creative_must_match_objective" in rule_map and creative and final_outcome == "APPROVED":
+        creative_campaign_type = creative.get("campaign_type", "")
+        passed = not creative_campaign_type or creative_campaign_type == objective
+        rules_evaluated.append({
+            "rule": "creative_must_match_objective",
+            "creative_campaign_type": creative_campaign_type,
+            "campaign_objective": objective,
+            "passed": passed,
+            "action_if_fail": "FLAG"
+        })
+        if not passed:
+            final_outcome = "FLAG"
+            rule_triggered = "creative_rules.creative_must_match_objective"
+            reason = (
+                f"Creative '{creative.get('asset_name')}' is designed for "
+                f"{creative_campaign_type} but campaign objective is {objective}"
+            )
+
+    return {
+        "outcome": final_outcome,
+        "rule_triggered": rule_triggered,
+        "reason": reason,
+        "rules_evaluated": rules_evaluated
+    }
 
 def evaluate(proposed_action: dict, agent_instruction: str = "") -> dict:
     action_id = str(uuid.uuid4())
@@ -267,13 +360,25 @@ def evaluate(proposed_action: dict, agent_instruction: str = "") -> dict:
     rules_evaluated = spend_result["rules_evaluated"]
 
     if outcome == "APPROVED":
-        audience_rules = get_audience_rules(client_account_id)
-        audience_result = evaluate_audience_rules(audience_rules, proposed_action)
-        if audience_result["outcome"] != "APPROVED":
-            outcome = audience_result["outcome"]
-            rule_triggered = audience_result["rule_triggered"]
-            reason = audience_result["reason"]
-        rules_evaluated += audience_result["rules_evaluated"]
+        structure_rules = get_campaign_structure_rules(client_account_id)
+        recent_campaigns = get_recent_campaigns(client_account_id, days=30)
+        structure_result = evaluate_campaign_structure(structure_rules, proposed_action, recent_campaigns)
+        if structure_result["outcome"] != "APPROVED":
+            outcome = structure_result["outcome"]
+            rule_triggered = structure_result["rule_triggered"]
+            reason = structure_result["reason"]
+        rules_evaluated += structure_result["rules_evaluated"]
+
+    if outcome == "APPROVED":
+        creative_rules = get_creative_rules(client_account_id)
+        image_hash = proposed_action.get("image_hash", None)
+        creative = lookup_creative(client_account_id, image_hash) if image_hash else {}
+        creative_result = evaluate_creative_rules(creative_rules, proposed_action, creative)
+        if creative_result["outcome"] != "APPROVED":
+            outcome = creative_result["outcome"]
+            rule_triggered = creative_result["rule_triggered"]
+            reason = creative_result["reason"]
+        rules_evaluated += creative_result["rules_evaluated"]
 
     if outcome == "APPROVED":
         structure_rules = get_campaign_structure_rules(client_account_id)

@@ -148,3 +148,47 @@ def get_recent_campaigns(client_account_id: str, days: int = 30) -> list:
     campaigns = [dict(row) for row in results]
     log.info(f"Loaded {len(campaigns)} recent campaigns for duplicate check")
     return campaigns
+
+def get_creative_rules(client_account_id: str) -> list:
+    """Fetch active creative rules for a client from BigQuery."""
+    query = f"""
+        SELECT rule_name, rule_value, rule_action
+        FROM `{PROJECT}.{DATASET}.rules_config`
+        WHERE client_account_id = @account_id
+          AND rule_category = 'creative_rules'
+          AND is_active = TRUE
+        ORDER BY rule_name
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id)
+        ]
+    )
+    results = BQ_CLIENT.query(query, job_config=job_config).result()
+    rules = [dict(row) for row in results]
+    log.info(f"Loaded {len(rules)} creative rules for {client_account_id}")
+    return rules
+
+
+def lookup_creative(client_account_id: str, image_hash: str) -> dict:
+    """Look up a creative asset by hash in the approved library."""
+    query = f"""
+        SELECT asset_id, asset_name, asset_type, format, campaign_type,
+               is_approved, approved_by, expires_at
+        FROM `{PROJECT}.{DATASET}.creative_library`
+        WHERE client_account_id = @account_id
+          AND meta_image_hash = @image_hash
+        LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id),
+            bigquery.ScalarQueryParameter("image_hash", "STRING", image_hash)
+        ]
+    )
+    results = list(BQ_CLIENT.query(query, job_config=job_config).result())
+    if results:
+        log.info(f"Creative found: {results[0]['asset_name']}")
+        return dict(results[0])
+    log.warning(f"Creative hash {image_hash} not found in library")
+    return {}

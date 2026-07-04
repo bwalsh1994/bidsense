@@ -102,3 +102,49 @@ def get_audience_rules(client_account_id: str) -> list:
     rules = [dict(row) for row in results]
     log.info(f"Loaded {len(rules)} audience rules for {client_account_id}")
     return rules
+
+def get_campaign_structure_rules(client_account_id: str) -> list:
+    """Fetch active campaign structure rules for a client from BigQuery."""
+    query = f"""
+        SELECT rule_name, rule_value, rule_action
+        FROM `{PROJECT}.{DATASET}.rules_config`
+        WHERE client_account_id = @account_id
+          AND rule_category = 'campaign_structure'
+          AND is_active = TRUE
+        ORDER BY rule_name
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id)
+        ]
+    )
+    results = BQ_CLIENT.query(query, job_config=job_config).result()
+    rules = [dict(row) for row in results]
+    log.info(f"Loaded {len(rules)} structure rules for {client_account_id}")
+    return rules
+
+
+def get_recent_campaigns(client_account_id: str, days: int = 30) -> list:
+    """Fetch recent campaigns from audit log for duplicate detection."""
+    query = f"""
+        SELECT
+            JSON_VALUE(proposed_action, '$.name') as name,
+            JSON_VALUE(proposed_action, '$.objective') as objective,
+            timestamp
+        FROM `{PROJECT}.{DATASET}.audit_log`
+        WHERE client_account_id = @account_id
+          AND outcome = 'APPROVED'
+          AND timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+          AND JSON_VALUE(proposed_action, '$.action') = 'create_campaign'
+        ORDER BY timestamp DESC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id),
+            bigquery.ScalarQueryParameter("days", "INT64", days)
+        ]
+    )
+    results = BQ_CLIENT.query(query, job_config=job_config).result()
+    campaigns = [dict(row) for row in results]
+    log.info(f"Loaded {len(campaigns)} recent campaigns for duplicate check")
+    return campaigns

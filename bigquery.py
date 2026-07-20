@@ -192,3 +192,117 @@ def lookup_creative(client_account_id: str, image_hash: str) -> dict:
         return dict(results[0])
     log.warning(f"Creative hash {image_hash} not found in library")
     return {}
+def get_audit_stats() -> dict:
+    """Returns aggregated outcome stats from the audit log."""
+    query = f"""
+        SELECT
+            outcome,
+            COUNT(*) as count,
+            SUM(spend_value) as total_spend,
+            SUM(spend_protected) as total_protected
+        FROM `{PROJECT}.{DATASET}.audit_log`
+        GROUP BY outcome
+    """
+    results = BQ_CLIENT.query(query).result()
+    stats = {"APPROVED": 0, "FLAG": 0, "BLOCK": 0, "total_protected": 0.0, "total_actions": 0}
+    for row in results:
+        outcome = row["outcome"]
+        if outcome in stats:
+            stats[outcome] = row["count"]
+        stats["total_protected"] += row["total_protected"] or 0.0
+        stats["total_actions"] += row["count"]
+    return stats
+
+
+def get_recent_audit_log(limit: int = 10) -> list:
+    """Returns most recent actions from the audit log."""
+    query = f"""
+        SELECT
+            action_id,
+            client_name,
+            outcome,
+            rule_triggered,
+            spend_value,
+            spend_protected,
+            timestamp,
+            JSON_VALUE(proposed_action, '$.name') as campaign_name
+        FROM `{PROJECT}.{DATASET}.audit_log`
+        ORDER BY timestamp DESC
+        LIMIT {limit}
+    """
+    results = BQ_CLIENT.query(query).result()
+    rows = []
+    for row in results:
+        rows.append({
+            "action_id": row["action_id"],
+            "client_name": row["client_name"],
+            "outcome": row["outcome"],
+            "rule_triggered": row["rule_triggered"],
+            "spend_value": float(row["spend_value"] or 0),
+            "spend_protected": float(row["spend_protected"] or 0),
+            "timestamp": str(row["timestamp"]),
+            "campaign_name": row["campaign_name"] or "Unknown"
+        })
+    return rows
+
+def get_all_rules(client_account_id: str) -> list:
+    """Returns all rules for a client grouped by category."""
+    query = f"""
+        SELECT rule_category, rule_name, rule_value, rule_action, is_active, notes
+        FROM `{PROJECT}.{DATASET}.rules_config`
+        WHERE client_account_id = @account_id
+        ORDER BY rule_category, rule_name
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id)
+        ]
+    )
+    results = BQ_CLIENT.query(query, job_config=job_config).result()
+    rules = []
+    for row in results:
+        rules.append({
+            "rule_category": row["rule_category"],
+            "rule_name": row["rule_name"],
+            "rule_value": row["rule_value"],
+            "rule_action": row["rule_action"],
+            "is_active": row["is_active"],
+            "notes": row["notes"]
+        })
+    log.info(f"Loaded {len(rules)} total rules for {client_account_id}")
+    return rules
+
+
+def update_rule_in_bigquery(client_account_id: str, rule_category: str, rule_name: str, rule_value: str = None, is_active: bool = None) -> bool:
+    """Updates a rule's value or active status in BigQuery."""
+    updates = []
+    params = [
+        bigquery.ScalarQueryParameter("account_id", "STRING", client_account_id),
+        bigquery.ScalarQueryParameter("rule_name", "STRING", rule_name),
+        bigquery.ScalarQueryParameter("rule_category", "STRING", rule_category),
+    ]
+
+    if rule_value is not None:
+        updates.append("rule_value = @rule_value")
+        params.append(bigquery.ScalarQueryParameter("rule_value", "STRING", str(rule_value)))
+
+    if is_active is not None:
+        updates.append("is_active = @is_active")
+        params.append(bigquery.ScalarQueryParameter("is_active", "BOOL", is_active))
+
+    if not updates:
+        return False
+
+    updates.append("updated_at = CURRENT_TIMESTAMP()")
+
+    query = f"""
+        UPDATE `{PROJECT}.{DATASET}.rules_config`
+        SET {', '.join(updates)}
+        WHERE client_account_id = @account_id
+          AND rule_name = @rule_name
+          AND rule_category = @rule_category
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    BQ_CLIENT.query(query, job_config=job_config).result()
+    log.info(f"Updated rule {rule_name} for {client_account_id}")
+    return True

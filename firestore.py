@@ -33,3 +33,25 @@ def write_approval_queue(
     }
     FS_CLIENT.collection("approval_queue").document(action_id).set(doc)
     log.info(f"Approval queue entry written: {action_id}")
+def get_pending_approvals() -> list:
+    """Returns pending items from the Firestore approval queue."""
+    try:
+        docs = DB.collection("approval_queue").where("status", "==", "PENDING").stream()
+        items = []
+        for doc in docs:
+            data = doc.to_dict()
+            items.append({
+                "id": doc.id,
+                "action_id": data.get("action_id"),
+                "client_name": data.get("client_name"),
+                "campaign_name": data.get("proposed_action", {}).get("name", "Unknown"),
+                "rule_triggered": data.get("rule_triggered"),
+                "reason": data.get("reason"),
+                "spend_value": data.get("spend_value", 0),
+                "agent_instruction": data.get("agent_instruction"),
+                "created_at": str(data.get("created_at", ""))
+            })
+        return items
+    except Exception as e:
+        log.error(f"Error fetching approval queue: {e}")
+        return []
